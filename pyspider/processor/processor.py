@@ -16,6 +16,7 @@ from six.moves import queue as Queue
 from pyspider.libs import utils
 from pyspider.libs.log import LogFormatter
 from pyspider.libs.utils import pretty_unicode, hide_me
+from pyspider.libs.error_policy import classify_exception, classify_fetch_error
 from pyspider.libs.response import rebuild_response
 from .project_module import ProjectManager, ProjectFinder
 
@@ -62,6 +63,7 @@ class ProcessorResult(object):
 class Processor(object):
     PROCESS_TIME_LIMIT = 30
     EXCEPTION_LIMIT = 3
+    EXCEPTION_BACKOFF_MAX = 60
 
     RESULT_LOGS_LIMIT = 1000
     RESULT_RESULT_LIMIT = 10
@@ -78,7 +80,7 @@ class Processor(object):
         self.enable_stdout_capture = enable_stdout_capture
 
         self._quit = False
-        self._exceptions = 10
+        self._exceptions = 0
         self.project_manager = ProjectManager(projectdb, dict(
             result_queue=self.result_queue,
             enable_stdout_capture=self.enable_stdout_capture,
@@ -142,6 +144,10 @@ class Processor(object):
                         'redirect_url': response.url if response.url != response.orig_url else None,
                         'time': response.time,
                         'error': response.error,
+                        'error_category': (
+                            None if response.isok()
+                            else classify_fetch_error(response.status_code, response.error)
+                        ),
                         'status_code': response.status_code,
                         'encoding': getattr(response, '_encoding', None),
                         'headers': track_headers,
@@ -151,6 +157,7 @@ class Processor(object):
                         'ok': not ret.exception,
                         'time': process_time,
                         'follows': len(ret.follows),
+                        'exception_type': classify_exception(ret.exception),
                         'result': (
                             None if ret.result is None
                             else utils.text(ret.result)[:self.RESULT_RESULT_LIMIT]
@@ -223,7 +230,17 @@ class Processor(object):
                 logger.exception(e)
                 self._exceptions += 1
                 if self._exceptions > self.EXCEPTION_LIMIT:
-                    break
+                    # do not kill the whole process on consecutive exceptions,
+                    # backoff and keep consuming instead
+                    backoff = min(
+                        2 ** (self._exceptions - self.EXCEPTION_LIMIT),
+                        self.EXCEPTION_BACKOFF_MAX,
+                    )
+                    logger.critical(
+                        'processor caught %d consecutive exceptions, '
+                        'backoff %ds and keep running',
+                        self._exceptions, backoff)
+                    time.sleep(backoff)
                 continue
 
         logger.info("processor exiting...")

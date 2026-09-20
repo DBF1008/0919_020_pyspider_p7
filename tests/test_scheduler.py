@@ -868,6 +868,187 @@ class TestProject(unittest.TestCase):
         self.assertFalse(self.project.paused)
         self.scheduler.FAIL_PAUSE_NUM = fail_pause_num
 
+    def test_pause_x_will_retry_not_counted(self):
+        '''tasks waiting for retry should not trigger the paused state machine'''
+        self.project._paused = False
+        self.project.active_tasks.clear()
+        will_retry_fail_pack = dict(self.status_fail_pack)
+        will_retry_fail_pack['will_retry'] = True
+        for i in range(self.scheduler.FAIL_PAUSE_NUM * 2):
+            self.project.active_tasks.appendleft((time.time(), dict(will_retry_fail_pack)))
+        self.assertFalse(self.project.paused)
+        self.assertFalse(self.project._paused)
+        # without the will_retry mark, the same packs do trigger pause
+        self.project.active_tasks.clear()
+        for i in range(self.scheduler.FAIL_PAUSE_NUM):
+            self.project.active_tasks.appendleft((time.time(), dict(self.status_fail_pack)))
+        self.assertTrue(self.project.paused)
+        self.project._paused = False
+        self.project.active_tasks.clear()
+
+
+class TestDeadLetter(unittest.TestCase):
+    '''retry policy / dead letter queue integration with Scheduler.on_task_failed'''
+    data_path = './data/tests_deadletter'
+
+    def setUp(self):
+        shutil.rmtree(self.data_path, ignore_errors=True)
+        os.makedirs(self.data_path)
+        self.taskdb = taskdb.TaskDB(os.path.join(self.data_path, 'task.db'))
+        self.projectdb = projectdb.ProjectDB(os.path.join(self.data_path, 'project.db'))
+        self.resultdb = resultdb.ResultDB(os.path.join(self.data_path, 'result.db'))
+        self.scheduler = Scheduler(
+            taskdb=self.taskdb, projectdb=self.projectdb,
+            newtask_queue=Queue(10), status_queue=Queue(10),
+            out_queue=Queue(10), data_path=self.data_path,
+            resultdb=self.resultdb)
+        self.scheduler.DEFAULT_RETRY_DELAY = {'': 0}
+        self.scheduler._update_project({
+            'name': 'test_project',
+            'group': 'group',
+            'status': 'RUNNING',
+            'script': '',
+            'comments': '',
+            'rate': 100000,
+            'burst': 100000,
+            'updatetime': time.time(),
+        })
+        self.project = self.scheduler.projects['test_project']
+        self.project.on_get_info({})
+
+    def tearDown(self):
+        shutil.rmtree(self.data_path, ignore_errors=True)
+
+    def _submit_and_select(self, taskid='taskid', schedule=None):
+        task = {
+            'taskid': taskid,
+            'project': 'test_project',
+            'url': 'http://example.com/%s' % taskid,
+        }
+        if schedule:
+            task['schedule'] = schedule
+        self.scheduler.on_new_request(task)
+        self.project.task_queue.check_update()
+        self.assertEqual(self.project.task_queue.get(), taskid)
+
+    def _fail(self, taskid='taskid', fetch_ok=True, status_code=200,
+              error=None, exception_type=None):
+        track = {
+            'fetch': {
+                'ok': fetch_ok,
+                'status_code': status_code,
+                'error': error,
+                'time': 0.01,
+            },
+            'process': {
+                'ok': False,
+                'time': 0.01,
+            },
+        }
+        if exception_type:
+            track['process']['exception_type'] = exception_type
+        self.scheduler.on_task_status({
+            'taskid': taskid,
+            'project': 'test_project',
+            'url': 'http://example.com/%s' % taskid,
+            'track': track,
+        })
+
+    def test_10_retry_then_dead_letter(self):
+        self._submit_and_select(schedule={'retries': 1})
+        self._fail()  # retried 0/1 -> retry
+        # retried task is marked will_retry for the paused state machine
+        self.assertTrue(self.project.active_tasks[0][1].get('will_retry'))
+        # and requeued
+        self.project.task_queue.check_update()
+        self.assertEqual(self.project.task_queue.get(), 'taskid')
+
+        self._fail()  # retried 1/1 -> exhausted -> dead letter
+        self.assertEqual(len(self.scheduler._dead_letters), 1)
+        record = self.scheduler._dead_letters[0]
+        self.assertEqual(record['taskid'], 'taskid')
+        self.assertEqual(record['project'], 'test_project')
+        self.assertEqual(record['category'], 'unknown')
+        self.assertEqual(record['retried'], 1)
+        # task marked FAILED in taskdb, not dropped
+        dbtask = self.taskdb.get_task('test_project', 'taskid')
+        self.assertEqual(dbtask['status'], self.taskdb.FAILED)
+        # persisted to data_path
+        dead_letter_file = os.path.join(self.data_path, 'scheduler.deadletter')
+        self.assertTrue(os.path.exists(dead_letter_file))
+        with open(dead_letter_file) as fp:
+            lines = [x for x in fp.read().splitlines() if x]
+        self.assertEqual(len(lines), 1)
+
+    def test_20_fetch_error_category(self):
+        self._submit_and_select(schedule={'retries': 0})
+        self._fail(fetch_ok=False, status_code=599, error='Connection refused')
+        self.assertEqual(len(self.scheduler._dead_letters), 1)
+        self.assertEqual(self.scheduler._dead_letters[0]['category'], 'network')
+
+    def test_30_process_exception_category(self):
+        self._submit_and_select(schedule={'retries': 0})
+        self._fail(exception_type='parse')
+        self.assertEqual(len(self.scheduler._dead_letters), 1)
+        self.assertEqual(self.scheduler._dead_letters[0]['category'], 'parse')
+
+    def test_40_retry_policy_config(self):
+        self.scheduler.RETRY_POLICY = {
+            'default': {
+                'max_retries': 5,
+                'backoff': 'exponential',
+                'base_delay': 100,
+                'factor': 2.0,
+            },
+            'categories': {
+                'business': {'max_retries': 0},
+            },
+        }
+        # business error: no retry at all, straight to dead letter
+        self._submit_and_select(taskid='t1')
+        self._fail(taskid='t1', fetch_ok=False, status_code=404)
+        self.assertEqual(len(self.scheduler._dead_letters), 1)
+        self.assertEqual(self.scheduler._dead_letters[0]['category'], 'business')
+
+        # network error: exponential backoff, 100s for the first retry
+        self._submit_and_select(taskid='t2')
+        before = time.time()
+        self._fail(taskid='t2', fetch_ok=False, status_code=599)
+        dbtask = self.taskdb.get_task('test_project', 't2')
+        self.assertEqual(dbtask['schedule']['retried'], 1)
+        delay = dbtask['schedule']['exetime'] - before
+        self.assertGreater(delay, 90)
+        self.assertLessEqual(delay, 101)
+        self.assertEqual(len(self.scheduler._dead_letters), 1)
+
+    def test_50_legacy_project_retry_delay(self):
+        self.project.retry_delay = {0: 7, '': 99}
+        policy = self.scheduler._get_retry_policy(self.project)
+        self.assertEqual(policy.next_delay('network', 0, 3), 7)
+        self.assertEqual(policy.next_delay('network', 1, 3), 99)
+        self.assertIsNone(policy.next_delay('network', 3, 3))
+
+    def test_60_get_and_clear_dead_letters(self):
+        self._submit_and_select(taskid='t1', schedule={'retries': 0})
+        self._fail(taskid='t1')
+        self._submit_and_select(taskid='t2', schedule={'retries': 0})
+        self._fail(taskid='t2', fetch_ok=False, status_code=500)
+
+        records = self.scheduler.get_dead_letters()
+        self.assertEqual(len(records), 2)
+        # newest first
+        self.assertEqual(records[0]['taskid'], 't2')
+        records = self.scheduler.get_dead_letters(project='test_project', limit=1)
+        self.assertEqual(len(records), 1)
+        records = self.scheduler.get_dead_letters(project='no_such_project')
+        self.assertEqual(len(records), 0)
+
+        self.assertEqual(self.scheduler.clear_dead_letters(), 2)
+        self.assertEqual(len(self.scheduler._dead_letters), 0)
+        dead_letter_file = os.path.join(self.data_path, 'scheduler.deadletter')
+        with open(dead_letter_file) as fp:
+            self.assertEqual(fp.read(), '')
+
 
 if __name__ == '__main__':
     unittest.main()

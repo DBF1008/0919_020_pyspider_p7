@@ -304,12 +304,33 @@ class TestFetcher(unittest.TestCase):
         self.assertEqual(result['status_code'], 599)
         self.assertIn('error', result)
         self.assertIn('resolve', result['error'])
+        self.assertEqual(result.get('error_category'), 'network')
 
         self.inqueue.put(request)
         task, result = self.outqueue.get()
         self.assertEqual(result['status_code'], 599)
         self.assertIn('error', result)
         self.assertIn('resolve', result['error'])
+        self.assertEqual(result.get('error_category'), 'network')
+
+    def test_a115_handle_error_category(self):
+        class FakeHTTPError(Exception):
+            def __init__(self, code, message=''):
+                super(FakeHTTPError, self).__init__(message)
+                self.code = code
+
+        task = {'project': 'project', 'taskid': 'taskid'}
+        result = self.fetcher.handle_error(
+            'http', 'http://example.com/', task, time.time(),
+            FakeHTTPError(404, 'Not Found'))
+        self.assertEqual(result['status_code'], 404)
+        self.assertEqual(result['error_category'], 'business')
+
+        result = self.fetcher.handle_error(
+            'http', 'http://example.com/', task, time.time(),
+            Exception('Connection refused'))
+        self.assertEqual(result['status_code'], 599)
+        self.assertEqual(result['error_category'], 'network')
 
     def test_a120_http_get_with_proxy_fail(self):
         self.fetcher.proxy = self.proxy

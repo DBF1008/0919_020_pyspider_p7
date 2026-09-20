@@ -434,6 +434,7 @@ class TestProcessor(unittest.TestCase):
         self.assertEqual(status['track']['fetch']['ok'], False)
         self.assertEqual(status['track']['fetch']['time'], 0)
         self.assertEqual(status['track']['fetch']['status_code'], 598)
+        self.assertEqual(status['track']['fetch']['error_category'], 'network')
         self.assertEqual('123', status['track']['fetch']['headers']['last-modified'])
         self.assertIsNotNone(status['track']['fetch']['content'])
         self.assertEqual(status['track']['process']['ok'], False)
@@ -442,6 +443,7 @@ class TestProcessor(unittest.TestCase):
         self.assertIsNone(status['track']['process']['result'])
         self.assertGreater(len(status['track']['process']['logs']), 0)
         self.assertIsNotNone(status['track']['process']['exception'])
+        self.assertIsNotNone(status['track']['process']['exception_type'])
 
     def test_60_call_broken_project(self):
         # clear new task queue

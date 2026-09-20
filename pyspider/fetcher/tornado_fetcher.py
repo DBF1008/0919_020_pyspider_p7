@@ -31,6 +31,7 @@ from tornado.curl_httpclient import CurlAsyncHTTPClient
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
 
 from pyspider.libs import utils, dataurl, counter
+from pyspider.libs.error_policy import classify_fetch_error
 from pyspider.libs.url import quote_chinese
 from .cookie_utils import extract_cookies_to_jar
 logger = logging.getLogger('fetcher')
@@ -203,6 +204,7 @@ class Fetcher(object):
         result = {
             'status_code': getattr(error, 'code', 599),
             'error': utils.text(error),
+            'error_category': classify_fetch_error(getattr(error, 'code', 599), error),
             'traceback': traceback.format_exc() if sys.exc_info()[0] else None,
             'content': "",
             'time': time.time() - start_time,

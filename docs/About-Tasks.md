@@ -59,3 +59,46 @@ class MyHandler(BaseHandler):
         '': 24*60*60
     }
 ```
+
+#### error categories and retry policy
+
+Errors are classified into unified categories: `network` (timeout, connection, 5xx),
+`parse` (html/json/xml parse errors) and `business` (4xx, or `BusinessError` raised
+by the handler). You may raise `pyspider.libs.error_policy.NetworkError` /
+`ParseError` / `BusinessError` in a handler to mark the category explicitly.
+
+Each category can have its own retry strategy. Instead of the legacy delay map
+above, `retry_delay` also accepts a policy config:
+
+```
+class MyHandler(BaseHandler):
+    retry_delay = {
+        'default': {
+            'max_retries': 3,
+            'backoff': 'exponential',  # fixed | linear | exponential
+            'base_delay': 30,
+            'factor': 2.0,
+            'max_delay': 24*60*60,
+            'jitter': 0,
+        },
+        'categories': {
+            'network': {'max_retries': 5, 'base_delay': 30},
+            'parse': {'max_retries': 1, 'backoff': 'fixed', 'base_delay': 3600},
+            'business': {'max_retries': 0},
+        },
+    }
+```
+
+The scheduler wide default can be set with `Scheduler.RETRY_POLICY` in the same
+format. A task level `retries` in `self.crawl` always takes precedence over
+`max_retries`.
+
+#### dead letter queue
+
+When a task exceeds its max retries, it is moved into the dead letter queue
+instead of being dropped silently. The task is marked `FAILED` in taskdb and a
+record (taskid, project, url, error category, retried times, error) is kept by
+the scheduler (persisted to `data/scheduler.deadletter`, latest
+`Scheduler.DEAD_LETTER_LIMIT` records). Records can be queried and cleared via
+the scheduler XMLRPC methods `get_dead_letters(project=None, limit=100)` and
+`clear_dead_letters(project=None)`.
