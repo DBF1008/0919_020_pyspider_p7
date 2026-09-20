@@ -132,6 +132,7 @@ class BaseHandler(object):
     _min_tick = 0
     __env__ = {'not_inited': True}
     retry_delay = {}
+    retry_policy = None
 
     def _reset(self):
         """
@@ -457,5 +458,7 @@ class BaseHandler(object):
                 if not isinstance(self.retry_delay, dict):
                     self.retry_delay = {'': self.retry_delay}
                 self.save[each] = self.retry_delay
+            elif each == 'retry_policy':
+                self.save[each] = getattr(self, 'retry_policy', None)
             elif each == 'crawl_config':
                 self.save[each] = self.crawl_config

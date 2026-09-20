@@ -17,6 +17,9 @@ from pyspider.libs import utils
 from pyspider.libs.log import LogFormatter
 from pyspider.libs.utils import pretty_unicode, hide_me
 from pyspider.libs.response import rebuild_response
+from pyspider.libs.error_handling import (
+    ErrorType, classify_exception, classify_fetch_error,
+)
 from .project_module import ProjectManager, ProjectFinder
 
 
@@ -132,6 +135,17 @@ class Processor(object):
                         continue
                     track_headers[name] = response.headers[name]
 
+            # unified error taxonomy stamps for the scheduler retry policy.
+            # explicit TaskError categories win for process failures.
+            if ret.exception is not None:
+                process_error_type = classify_exception(ret.exception)
+            elif not response.isok():
+                # fetch failed and the callback did not raise: keep the
+                # fetcher-derived category so retries follow that policy
+                process_error_type = None
+            else:
+                process_error_type = None
+
             status_pack = {
                 'taskid': task['taskid'],
                 'project': task['project'],
@@ -142,6 +156,8 @@ class Processor(object):
                         'redirect_url': response.url if response.url != response.orig_url else None,
                         'time': response.time,
                         'error': response.error,
+                        'error_type': classify_fetch_error(
+                            response.error, response.status_code),
                         'status_code': response.status_code,
                         'encoding': getattr(response, '_encoding', None),
                         'headers': track_headers,
@@ -149,6 +165,7 @@ class Processor(object):
                     },
                     'process': {
                         'ok': not ret.exception,
+                        'error_type': process_error_type,
                         'time': process_time,
                         'follows': len(ret.follows),
                         'result': (
@@ -210,6 +227,9 @@ class Processor(object):
         '''Run loop'''
         logger.info("processor starting...")
 
+        # EXCEPTION_LIMIT is retained as a back-compat attribute but no
+        # longer exits the process: a burst of bad tasks must not kill the
+        # processor; back off and keep draining the queue.
         while not self._quit:
             try:
                 task, response = self.inqueue.get(timeout=1)
@@ -222,8 +242,8 @@ class Processor(object):
             except Exception as e:
                 logger.exception(e)
                 self._exceptions += 1
-                if self._exceptions > self.EXCEPTION_LIMIT:
-                    break
+                backoff = min(0.1 * 2 ** min(self._exceptions, 10), 30)
+                time.sleep(backoff)
                 continue
 
         logger.info("processor exiting...")

@@ -194,10 +194,14 @@ def cli(ctx, **kwargs):
 @click.option('--scheduler-cls', default='pyspider.scheduler.ThreadBaseScheduler', callback=load_cls,
               help='scheduler class to be used.')
 @click.option('--threads', default=None, help='thread number for ThreadBaseScheduler, default: 4')
+@click.option('--dead-letter-queue', default='memory',
+              type=click.Choice(['memory', 'sqlite', 'disabled']),
+              help='backend for tasks that exhausted their retry budget '
+              '(memory/sqlite/disabled)')
 @click.pass_context
 def scheduler(ctx, xmlrpc, no_xmlrpc, xmlrpc_host, xmlrpc_port,
               inqueue_limit, delete_time, active_tasks, loop_limit, fail_pause_num,
-              scheduler_cls, threads, get_object=False):
+              scheduler_cls, threads, dead_letter_queue='memory', get_object=False):
     """
     Run Scheduler, only one scheduler is allowed.
     """
@@ -207,6 +211,10 @@ def scheduler(ctx, xmlrpc, no_xmlrpc, xmlrpc_host, xmlrpc_port,
     kwargs = dict(taskdb=g.taskdb, projectdb=g.projectdb, resultdb=g.resultdb,
                   newtask_queue=g.newtask_queue, status_queue=g.status_queue,
                   out_queue=g.scheduler2fetcher, data_path=g.get('data_path', 'data'))
+    if dead_letter_queue == 'disabled':
+        kwargs['dead_letter_queue'] = False
+    else:
+        kwargs['dead_letter_queue'] = dead_letter_queue
     if threads:
         kwargs['threads'] = int(threads)
 

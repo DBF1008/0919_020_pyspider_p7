@@ -18,6 +18,11 @@ from six.moves import queue as Queue
 
 from pyspider.libs import counter, utils
 from pyspider.libs.base_handler import BaseHandler
+from pyspider.libs.error_handling import ErrorType, classify_task_error
+from pyspider.libs.retry import build_policy
+from pyspider.libs.dead_letter_queue import (
+    MemoryDeadLetterQueue, SqliteDeadLetterQueue,
+)
 from .task_queue import TaskQueue
 
 logger = logging.getLogger('scheduler')
@@ -45,6 +50,14 @@ class Project(object):
         self._paused = False
         self._paused_time = 0
         self._unpause_last_seen = None
+
+        # runtime info populated by on_get_info; initialised here so the
+        # project is usable before the processor reports back
+        self.min_tick = 0
+        self.retry_delay = {}
+        self.retry_policy = None
+        self.crawl_config = {}
+        self.retry_policies = None
 
         self.update(project_info)
 
@@ -131,6 +144,34 @@ class Project(object):
         self.min_tick = info.get('min_tick', 0)
         self.retry_delay = info.get('retry_delay', {})
         self.crawl_config = info.get('crawl_config', {})
+        # unified per-error-type retry policy (project level, optional)
+        self.retry_policy = info.get('retry_policy')
+        self.retry_policies = build_policy(self.retry_policy)
+
+    def get_retry_policy(self, schedule):
+        '''
+        Resolve the effective retry policy for a failed task.
+
+        Per-task ``schedule['retry_policy']`` wins over the project level
+        policy, which wins over the scheduler level policy.  A per-task
+        ``schedule['retries']`` may be either an int or an
+        ``{error_type: max_retries}`` mapping.
+        '''
+        task_policy_config = (schedule or {}).get('retry_policy')
+        if task_policy_config is not None:
+            return build_policy(task_policy_config)
+
+        # start from the scheduler level policy and let a project level
+        # policy (reported through _on_get_info) override per category
+        policies = self.scheduler.retry_policies
+        if getattr(self, 'retry_policy', None) is not None:
+            policies = self.retry_policies
+        elif self.retry_delay:
+            # legacy project retry_delay table applies the same custom
+            # delays on top of the scheduler retry budgets
+            policies = build_policy(self.retry_delay)
+
+        return policies
 
     @property
     def active(self):
@@ -152,6 +193,8 @@ class Scheduler(object):
     INQUEUE_LIMIT = 0
     EXCEPTION_LIMIT = 3
     DELETE_TIME = 24 * 60 * 60
+    # legacy fixed retry-delay table, retained for backward compatibility;
+    # the retry_policy mechanism (per error type) supersedes it
     DEFAULT_RETRY_DELAY = {
         0: 30,
         1: 1*60*60,
@@ -163,12 +206,19 @@ class Scheduler(object):
     PAUSE_TIME = 5*60
     UNPAUSE_CHECK_NUM = 3
 
+    # dead letter queue: True -> in-memory, 'sqlite' -> persistent file,
+    # False/None -> disabled (exhausted tasks are merely marked FAILED)
+    DEAD_LETTER_QUEUE = True
+    DEAD_LETTER_QUEUE_MAX_SIZE = 1000
+
     TASK_PACK = 1
     STATUS_PACK = 2  # current not used
     REQUEST_PACK = 3  # current not used
 
     def __init__(self, taskdb, projectdb, newtask_queue, status_queue,
-                 out_queue, data_path='./data', resultdb=None):
+                 out_queue, data_path='./data', resultdb=None,
+                 retry_policy=None, dead_letter_queue=None,
+                 dead_letter_queue_max_size=None):
         self.taskdb = taskdb
         self.projectdb = projectdb
         self.resultdb = resultdb
@@ -176,6 +226,25 @@ class Scheduler(object):
         self.status_queue = status_queue
         self.out_queue = out_queue
         self.data_path = data_path
+
+        # unified per-error-type retry policies
+        self.retry_policy = retry_policy
+        self.retry_policies = build_policy(retry_policy)
+
+        if dead_letter_queue_max_size is None:
+            dead_letter_queue_max_size = self.DEAD_LETTER_QUEUE_MAX_SIZE
+        if dead_letter_queue is False:
+            # explicitly disabled: exhausted tasks are merely marked FAILED
+            self.dead_letter_queue = None
+        elif isinstance(dead_letter_queue,
+                        (MemoryDeadLetterQueue, SqliteDeadLetterQueue)):
+            self.dead_letter_queue = dead_letter_queue
+        else:
+            # None -> class default backend; True -> in-memory; 'sqlite' -> sqlite
+            backend = self.DEAD_LETTER_QUEUE if dead_letter_queue is None \
+                else dead_letter_queue
+            self.dead_letter_queue = self._make_dead_letter_queue(
+                backend, dead_letter_queue_max_size)
 
         self._send_buffer = deque()
         self._quit = False
@@ -203,6 +272,26 @@ class Scheduler(object):
         self._cnt['all'].load(os.path.join(self.data_path, 'scheduler.all'))
         self._last_dump_cnt = 0
 
+    def _make_dead_letter_queue(self, backend, max_size):
+        """Create a dead letter queue backend.
+
+        ``backend`` may be True/'memory' (in-memory) or 'sqlite'
+        (persistent file under ``data_path``).  Everything else disables
+        the queue.
+        """
+        if backend in (True, 'memory'):
+            return MemoryDeadLetterQueue(max_size=max_size)
+        if backend in ('sqlite', 'persistent'):
+            db_path = os.path.join(self.data_path, 'dead_letter.db')
+            return SqliteDeadLetterQueue(db_path, max_size=max_size)
+        return None
+
+    def _move_to_dead_letter(self, task, error_type, retried, reason=''):
+        """Persist a task that exhausted its retry budget."""
+        if self.dead_letter_queue is None:
+            return None
+        return self.dead_letter_queue.put(task, error_type, reason, retried)
+
     def _update_projects(self):
         '''Check project update'''
         now = time.time()
@@ -217,7 +306,7 @@ class Scheduler(object):
         self._force_update_project = False
         self._last_update_project = now
 
-    get_info_attributes = ['min_tick', 'retry_delay', 'crawl_config']
+    get_info_attributes = ['min_tick', 'retry_delay', 'retry_policy', 'crawl_config']
 
     def _update_project(self, project):
         '''update one project'''
@@ -674,6 +763,10 @@ class Scheduler(object):
         '''Start scheduler loop'''
         logger.info("scheduler starting...")
 
+        # EXCEPTION_LIMIT is kept as a back-compat attribute but no longer
+        # terminates the process: one poison task must not take the scheduler
+        # down.  Consecutive loop errors are logged and the counter resets on
+        # every healthy loop, with an escalating backoff to avoid hot-spinning.
         while not self._quit:
             try:
                 time.sleep(self.LOOP_INTERVAL)
@@ -684,8 +777,9 @@ class Scheduler(object):
             except Exception as e:
                 logger.exception(e)
                 self._exceptions += 1
-                if self._exceptions > self.EXCEPTION_LIMIT:
-                    break
+                backoff = min(self.LOOP_INTERVAL * 2 ** min(self._exceptions, 10),
+                              30)
+                time.sleep(backoff)
                 continue
 
         logger.info("scheduler exiting...")
@@ -785,6 +879,47 @@ class Scheduler(object):
                 result[project_name] = project.paused
             return result
         application.register_function(get_projects_pause_status, 'get_projects_pause_status')
+
+        def dead_letter_list(limit=100, project=None):
+            """list dead letter entries (newest first)"""
+            if self.dead_letter_queue is None:
+                return []
+            entries = self.dead_letter_queue.list(limit=limit, project=project)
+            return [dict(e, task=None) for e in entries]
+
+        application.register_function(dead_letter_list, 'dead_letter_list')
+
+        def dead_letter_size(project=None):
+            """number of tasks parked in the dead letter queue"""
+            if self.dead_letter_queue is None:
+                return 0
+            return self.dead_letter_queue.size(project)
+
+        application.register_function(dead_letter_size, 'dead_letter_size')
+
+        def dead_letter_requeue(entry_id):
+            """reactivate a dead letter task and put it back on the queue"""
+            if self.dead_letter_queue is None:
+                return False
+            entry = self.dead_letter_queue.get(entry_id)
+            if entry is None:
+                return False
+            task = self.dead_letter_queue.requeue_task(entry)
+            task['status'] = self.taskdb.ACTIVE
+            self.update_task(task)
+            self.put_task(task)
+            self.dead_letter_queue.pop(entry_id)
+            return True
+
+        application.register_function(dead_letter_requeue, 'dead_letter_requeue')
+
+        def dead_letter_drop(entry_id):
+            """permanently discard a dead letter entry"""
+            if self.dead_letter_queue is None:
+                return False
+            return self.dead_letter_queue.pop(entry_id) is not None
+
+        application.register_function(dead_letter_drop, 'dead_letter_drop')
 
         def webui_update():
             return {
@@ -944,24 +1079,79 @@ class Scheduler(object):
                 return
             task['schedule'] = old_task.get('schedule', {})
 
-        retries = task['schedule'].get('retries', self.default_schedule['retries'])
-        retried = task['schedule'].get('retried', 0)
+        schedule = task.get('schedule') or {}
+        retried = schedule.get('retried', 0)
+        now = time.time()
+
+        # unified error classification: explicit stamp from fetcher/processor
+        # wins, otherwise derive the category from status code / exception.
+        error_type = classify_task_error(task)
+        schedule['error_type'] = error_type
+        task['schedule'] = schedule
 
         project_info = self.projects[task['project']]
-        retry_delay = project_info.retry_delay or self.DEFAULT_RETRY_DELAY
-        next_exetime = retry_delay.get(retried, retry_delay.get('', self.DEFAULT_RETRY_DELAY['']))
+        policies = project_info.get_retry_policy(schedule)
+        policy = policies.get(error_type) or policies[ErrorType.UNKNOWN]
 
-        if task['schedule'].get('auto_recrawl') and 'age' in task['schedule']:
-            next_exetime = min(next_exetime, task['schedule'].get('age'))
+        # retry budget resolution:
+        # 1. per-task {'retries': {error_type: n}} mapping always wins
+        # 2. when a retry_policy is configured at scheduler/project/task
+        #    level, its per-category budget is authoritative (the historical
+        #    schedule['retries'] default of 3 must not silently override it)
+        # 3. otherwise the legacy schedule['retries'] / default 3 applies
+        policy_configured = (
+            self.retry_policy is not None
+            or getattr(project_info, 'retry_policy', None) is not None
+            or schedule.get('retry_policy') is not None
+        )
+        task_retries = schedule.get('retries', None)
+        if isinstance(task_retries, dict):
+            max_retries = int(task_retries.get(
+                error_type,
+                task_retries.get('', self.default_schedule['retries'])))
+            should_retry = retried < max_retries
+        elif not policy_configured and task_retries is not None:
+            should_retry = retried < int(task_retries)
         else:
-            if retried >= retries:
-                next_exetime = -1
-            elif 'age' in task['schedule'] and next_exetime > task['schedule'].get('age'):
-                next_exetime = task['schedule'].get('age')
+            should_retry = policy.should_retry(retried)
 
-        if next_exetime < 0:
+        # delay precedence:
+        # 1. explicit retry_policy at task/project level -> its strategy
+        # 2. legacy project retry_delay table
+        # 3. scheduler level policy strategy
+        # 4. built-in DEFAULT_RETRY_DELAY table
+        if schedule.get('retry_policy') is not None \
+                or getattr(project_info, 'retry_policy', None) is not None:
+            next_delay = policy.get_delay(retried)
+        elif project_info.retry_delay:
+            next_delay = project_info.retry_delay.get(
+                retried,
+                project_info.retry_delay.get('', self.DEFAULT_RETRY_DELAY['']))
+        elif self.retry_policy is not None:
+            next_delay = policy.get_delay(retried)
+        else:
+            next_delay = self.DEFAULT_RETRY_DELAY.get(
+                retried, self.DEFAULT_RETRY_DELAY[''])
+
+        if schedule.get('auto_recrawl') and 'age' in schedule:
+            next_delay = min(next_delay, schedule.get('age'))
+        elif 'age' in schedule and next_delay > schedule.get('age'):
+            next_delay = schedule.get('age')
+
+        if not should_retry:
+            # retry budget exhausted: move into the dead letter queue instead
+            # of dropping the task on the floor.
+            reason = ''
+            fetch_track = task.get('track', {}).get('fetch', {})
+            process_track = task.get('track', {}).get('process', {})
+            if fetch_track.get('error'):
+                reason = utils.text(fetch_track['error'])
+            elif process_track.get('exception'):
+                reason = utils.text(process_track['exception'])
+            self._move_to_dead_letter(task, error_type, retried, reason)
+
             task['status'] = self.taskdb.FAILED
-            task['lastcrawltime'] = time.time()
+            task['lastcrawltime'] = now
             self.update_task(task)
 
             project = task['project']
@@ -969,12 +1159,17 @@ class Scheduler(object):
             self._cnt['1h'].event((project, 'failed'), +1)
             self._cnt['1d'].event((project, 'failed'), +1)
             self._cnt['all'].event((project, 'failed'), +1).event((project, 'pending'), -1)
-            logger.info('task failed %(project)s:%(taskid)s %(url)s' % task)
+            if self.dead_letter_queue is not None:
+                logger.info('task dead letter %s %%(project)s:%%(taskid)s %%(url)s' % error_type,
+                            task)
+            else:
+                logger.info('task failed %(project)s:%(taskid)s %(url)s' % task)
             return task
         else:
-            task['schedule']['retried'] = retried + 1
-            task['schedule']['exetime'] = time.time() + next_exetime
-            task['lastcrawltime'] = time.time()
+            schedule['retried'] = retried + 1
+            schedule['exetime'] = now + next_delay
+            task['schedule'] = schedule
+            task['lastcrawltime'] = now
             self.update_task(task)
             self.put_task(task)
 
@@ -983,9 +1178,10 @@ class Scheduler(object):
             self._cnt['1h'].event((project, 'retry'), +1)
             self._cnt['1d'].event((project, 'retry'), +1)
             # self._cnt['all'].event((project, 'retry'), +1)
-            logger.info('task retry %d/%d %%(project)s:%%(taskid)s %%(url)s' % (
-                retried, retries), task)
+            logger.info('task retry %d [%s] in %ss %%(project)s:%%(taskid)s %%(url)s' % (
+                retried + 1, error_type, next_delay), task)
             return task
+
 
     def on_select_task(self, task):
         '''Called when a task is selected to fetch & process'''

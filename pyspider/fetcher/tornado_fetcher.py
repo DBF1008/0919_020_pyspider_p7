@@ -31,6 +31,7 @@ from tornado.curl_httpclient import CurlAsyncHTTPClient
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
 
 from pyspider.libs import utils, dataurl, counter
+from pyspider.libs.error_handling import classify_fetch_error
 from pyspider.libs.url import quote_chinese
 from .cookie_utils import extract_cookies_to_jar
 logger = logging.getLogger('fetcher')
@@ -200,9 +201,13 @@ class Fetcher(object):
         return result
 
     def handle_error(self, type, url, task, start_time, error):
+        status_code = getattr(error, 'code', 599)
+        error_text = utils.text(error)
         result = {
-            'status_code': getattr(error, 'code', 599),
-            'error': utils.text(error),
+            'status_code': status_code,
+            'error': error_text,
+            # unified error taxonomy stamp for the scheduler retry policy
+            'error_type': classify_fetch_error(error, status_code),
             'traceback': traceback.format_exc() if sys.exc_info()[0] else None,
             'content': "",
             'time': time.time() - start_time,
@@ -211,7 +216,7 @@ class Fetcher(object):
             "save": task.get('fetch', {}).get('save')
         }
         logger.error("[%d] %s:%s %s, %r %.2fs",
-                     result['status_code'], task.get('project'), task.get('taskid'),
+                     status_code, task.get('project'), task.get('taskid'),
                      url, error, result['time'])
         return result
 
@@ -830,6 +835,11 @@ class Fetcher(object):
 
     def on_result(self, type, task, result):
         '''Called after task fetched'''
+        # stamp the unified error category for every fetch result that does
+        # not already carry one (handle_error stamps raised exceptions)
+        if 'error_type' not in result:
+            result['error_type'] = classify_fetch_error(
+                result.get('error'), result.get('status_code'))
         status_code = result.get('status_code', 599)
         if status_code != 599:
             status_code = (int(status_code) / 100 * 100)
